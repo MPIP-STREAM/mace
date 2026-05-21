@@ -84,6 +84,7 @@ def fitting_configs_fixture():
         c.positions += np.random.normal(0.1, size=c.positions.shape)
         c.info["REF_energy"] = np.random.normal(0.1)
         c.info["REF_dipole"] = np.random.normal(0.1, size=3)
+        c.info["REF_polarizability"] = np.random.normal(0.1, size=(3, 3))
         c.new_array("REF_forces", np.random.normal(0.1, size=c.positions.shape))
         c.new_array("Qs", np.random.normal(0.1, size=c.positions.shape[0]))
         c.info["REF_stress"] = np.random.normal(0.1, size=6)
@@ -686,6 +687,51 @@ def test_calculator_energy_dipole(
     assert np.allclose(grads[0], grads[1])
     assert len(dip) == 3
     write_extxyz_test(tmp_path, at)
+
+
+def test_calculator_dipole_polar_properties(
+    fitting_configs, trained_dipole_polarizability_model
+):
+    at = fitting_configs[2].copy()
+    calc = trained_dipole_polarizability_model
+    at.calc = calc
+
+    dip = at.get_dipole_moment()
+    alpha = calc.get_property("polarizability", at)
+
+    assert dip.shape == (3,)
+    assert alpha.shape == (3, 3)
+
+
+def test_calculator_bec_raman(fitting_configs, trained_dipole_polarizability_model):
+    at = fitting_configs[2].copy()
+    calc = trained_dipole_polarizability_model
+    n_atoms = len(at)
+
+    bec, raman = calc.get_dielectric_derivatives(at)
+
+    assert bec.shape == (n_atoms, 3, 3), f"Expected ({n_atoms}, 3, 3), got {bec.shape}"
+    assert raman.shape == (n_atoms, 3, 3, 3), (
+        f"Expected ({n_atoms}, 3, 3, 3), got {raman.shape}"
+    )
+
+    # Results should be cached in calc.results
+    assert "bec" in calc.results
+    assert "raman_tensors" in calc.results
+
+
+def test_calculator_bec_raman_via_get_property(
+    fitting_configs, trained_dipole_polarizability_model
+):
+    at = fitting_configs[2].copy()
+    calc = trained_dipole_polarizability_model
+    n_atoms = len(at)
+
+    bec = calc.get_property("bec", at)
+    raman = calc.get_property("raman_tensors", at)
+
+    assert bec.shape == (n_atoms, 3, 3)
+    assert raman.shape == (n_atoms, 3, 3, 3)
 
 
 def test_calculator_descriptor(fitting_configs, trained_equivariant_model):

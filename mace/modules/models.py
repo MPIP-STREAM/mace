@@ -1135,25 +1135,38 @@ class AtomicDielectricMACE(torch.nn.Module):
                 dmu_dr = compute_dielectric_gradients(
                     dielectric=total_dipole,
                     positions=data["positions"],
-                )
+                )  # [3, N, 3]
                 dalpha_dr = compute_dielectric_gradients(
                     dielectric=total_polarizability.flatten(-2),
                     positions=data["positions"],
-                )
+                )  # [9, N, 3]
+                n_atoms = data["positions"].shape[0]
+                # Born effective charges: Z*[I, alpha, beta] = d mu_alpha / d R_I_beta
+                bec = dmu_dr.permute(1, 0, 2).contiguous()  # [N, 3, 3]
+                # Raman susceptibility: R[I, alpha, beta, gamma] = d alpha_alpha_beta / d R_I_gamma
+                raman_tensors = dalpha_dr.permute(1, 0, 2).contiguous().reshape(
+                    n_atoms, 3, 3, 3
+                )  # [N, 3, 3, 3]
             else:
                 dmu_dr = None
                 dalpha_dr = None
+                bec = None
+                raman_tensors = None
         else:
             if compute_dielectric_derivatives:
                 dmu_dr = compute_dielectric_gradients(
                     dielectric=total_dipole,
                     positions=data["positions"],
-                )
+                )  # [3, N, 3]
+                n_atoms = data["positions"].shape[0]
+                bec = dmu_dr.permute(1, 0, 2).contiguous()  # [N, 3, 3]
             else:
                 dmu_dr = None
+                bec = None
             total_polarizability = None
             total_polarizability_spherical = None
             dalpha_dr = None
+            raman_tensors = None
 
         output = {
             "charges": atomic_charges,
@@ -1163,6 +1176,8 @@ class AtomicDielectricMACE(torch.nn.Module):
             "polarizability_sh": total_polarizability_spherical,
             "dmu_dr": dmu_dr,
             "dalpha_dr": dalpha_dr,
+            "bec": bec,
+            "raman_tensors": raman_tensors,
         }
         return output
 

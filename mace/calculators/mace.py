@@ -10,7 +10,7 @@ import logging
 import os
 from glob import glob
 from pathlib import Path
-from typing import Dict, List, Union
+from typing import Any, Dict, List, Union
 
 os.environ["TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD"] = "1"
 
@@ -207,6 +207,8 @@ class MACECalculator(Calculator):
                     "charges",
                     "polarizability",
                     "polarizability_sh",
+                    "bec",
+                    "raman_tensors",
                 ]
             )
 
@@ -441,6 +443,8 @@ class MACECalculator(Calculator):
             "atomic_virials",
             "atomic_dipoles",
             "node_feats",
+            "bec",
+            "raman_tensors",
         }
         sliced: Dict[str, Union[torch.Tensor, None]] = {}
         for key, value in out.items():
@@ -468,6 +472,8 @@ class MACECalculator(Calculator):
             "charges": [num_atoms],
             "polarizability": [3, 3],
             "polarizability_sh": [6],
+            "bec": [num_atoms, 3, 3],
+            "raman_tensors": [num_atoms, 3, 3, 3],
         }
         if self.model_type == "PolarMACE":
             tensor_shapes.update(
@@ -605,6 +611,11 @@ class MACECalculator(Calculator):
         is_padded = self.pad_num_atoms > 0 or self.pad_num_edges > 0
 
         compute_stress = self.model_type in ["MACE", "EnergyDipoleMACE", "PolarMACE"]
+        compute_dielectric_derivatives = (
+            self.model_type == "DipolePolarizabilityMACE"
+            and properties is not None
+            and any(p in {"bec", "raman_tensors"} for p in properties)
+        )
         # For oeq/hybrid + compile: create displacement outside the compiled
         # graph so autograd.grad (which runs as a graph break) can
         # differentiate energy w.r.t. displacement for stress.
@@ -632,13 +643,17 @@ class MACECalculator(Calculator):
                 displacement = displacement + positions.sum() * 0.0
                 batch_dict["displacement"] = displacement
 
-            out = model(
-                batch_dict,
+            model_kwargs: Dict[str, Any] = dict(
                 compute_stress=compute_stress,
                 training=self.use_compile and not oeq_compile,
                 compute_edge_forces=self.compute_atomic_stresses,
                 compute_atomic_stresses=self.compute_atomic_stresses,
             )
+            if self.model_type == "DipolePolarizabilityMACE":
+                model_kwargs["compute_dielectric_derivatives"] = (
+                    compute_dielectric_derivatives
+                )
+            out = model(batch_dict, **model_kwargs)
             if is_padded:
                 out = self._slice_real_outputs(out, num_real_atoms)
             if i == 0:
@@ -672,6 +687,8 @@ class MACECalculator(Calculator):
             ("charges", "charges", 1.0),
             ("polarizability", "polarizability", 1.0),
             ("polarizability_sh", "polarizability_sh", 1.0),
+            ("bec", "bec", 1.0),
+            ("raman_tensors", "raman_tensors", 1.0),
         ]
         if self.model_type == "PolarMACE":
             results_map.extend(
