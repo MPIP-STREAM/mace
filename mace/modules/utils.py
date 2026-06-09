@@ -533,8 +533,20 @@ def compute_total_charge_dipole_permuted(
 def compute_dielectric_gradients(
     dielectric: torch.Tensor,
     positions: torch.Tensor,
-) -> Tuple[torch.tensor, torch.tensor]:
+    create_graph: bool = False,
+) -> torch.Tensor:
+    """Compute Jacobian of dielectric tensor w.r.t. atomic positions via vmapped VJPs.
+
+    Uses reverse-mode AD: one backward pass per output component (last dim of dielectric).
+    For BEC: 3 passes over dipole components. For Raman: 9 passes over polarizability components.
+
+    Args:
+        create_graph: set True only when training on BEC/Raman labels (needed for
+            higher-order gradients). False for inference — avoids building the
+            second-order computational graph and is significantly faster.
+    """
     dielectric_flatten = dielectric.view(-1)
+    n_out = dielectric_flatten.shape[0]
 
     def get_vjp(v):
         return torch.autograd.grad(
@@ -542,37 +554,74 @@ def compute_dielectric_gradients(
             positions,
             v,
             retain_graph=True,
-            create_graph=True,
+            create_graph=create_graph,
             allow_unused=False,
         )
 
     try:
-        I_N = torch.eye(dielectric.shape[-1]).to(dielectric.device)
-        gradient = torch.vmap(get_vjp, in_dims=0, out_dims=0)(I_N)[0]
+        I_N = torch.eye(n_out, dtype=positions.dtype, device=positions.device)
+        gradient = torch.func.vmap(get_vjp, in_dims=0, out_dims=0)(I_N)[0]
     except RuntimeError:
-        gradient = compute_dielectric_gradients_loop(dielectric, positions).detach()
+        gradient = compute_dielectric_gradients_loop(
+            dielectric, positions, create_graph=create_graph
+        )
     if gradient is None:
-        return torch.zeros((positions.shape[0], dielectric.shape[-1], 3))
+        return torch.zeros((positions.shape[0], n_out, 3))
     return gradient
 
 
 def compute_dielectric_gradients_loop(
     dielectric: torch.Tensor,
     positions: torch.Tensor,
+    create_graph: bool = False,
 ) -> torch.Tensor:
+    """Serial fallback for compute_dielectric_gradients when vmap is unavailable."""
+    dielectric_flatten = dielectric.view(-1)
+    n_out = dielectric_flatten.shape[0]
     gradients = []
-    for i in range(dielectric.shape[-1]):
-        grad_elem = dielectric[:, i]
+    for i in range(n_out):
         hess_row = torch.autograd.grad(
-            grad_elem,
+            dielectric_flatten[i],
             positions,
-            retain_graph=True,
-            create_graph=True,
+            retain_graph=(i < n_out - 1) or create_graph,
+            create_graph=create_graph,
             allow_unused=False,
         )[0]
         gradients.append(hess_row)
-    gradients = torch.stack(gradients)
-    return gradients
+    return torch.stack(gradients)
+
+
+@torch.jit.ignore
+def compute_bec_sparse(
+    atomic_dipoles: torch.Tensor,
+    atomic_charges: torch.Tensor,
+    positions: torch.Tensor,
+    edge_index: torch.Tensor,
+    batch: torch.Tensor,
+    num_graphs: int,
+    create_graph: bool = False,
+) -> torch.Tensor:
+    """Placeholder: sparse BEC computation exploiting MACE locality.
+
+    Future implementation will replace the dense reverse-mode Jacobian in
+    compute_dielectric_gradients (3 full backward passes over all N atoms) with
+    a per-atom approach that exploits the fact that d(mu_j)/d(R_I) is nonzero
+    only when atom I lies within r_cut of atom j. For each atom I, only the
+    atoms j in its reverse-neighbor list contribute to BEC[I], so the effective
+    work per atom scales with coordination number Z rather than N. For typical
+    systems (N=500-1000, Z~20) this aims to reduce the backward-pass cost by
+    a factor of ~N/Z (~25-50x), bringing BEC evaluation close to the cost of
+    a single forward pass.
+
+    Concretely, the plan is:
+      1. Build the reverse-neighbor list from edge_index (atoms j for which I ∈ neigh(j)).
+      2. For each atom I, sum local contributions d(mu_j)/d(R_I) over j in rev_neigh(I)
+         using per-atom VJPs restricted to the local subgraph.
+      3. Add the analytical charge-position term: q_I * delta_{alpha,beta}.
+    """
+    raise NotImplementedError(
+        "Sparse BEC not yet implemented; use compute_dielectric_gradients."
+    )
 
 
 class InteractionKwargs(NamedTuple):

@@ -616,6 +616,9 @@ class MACECalculator(Calculator):
             and properties is not None
             and any(p in {"bec", "raman_tensors"} for p in properties)
         )
+        compute_raman = (
+            properties is not None and "raman_tensors" in properties
+        )
         # For oeq/hybrid + compile: create displacement outside the compiled
         # graph so autograd.grad (which runs as a graph break) can
         # differentiate energy w.r.t. displacement for stress.
@@ -653,6 +656,7 @@ class MACECalculator(Calculator):
                 model_kwargs["compute_dielectric_derivatives"] = (
                     compute_dielectric_derivatives
                 )
+                model_kwargs["compute_raman_tensors"] = compute_raman
             out = model(batch_dict, **model_kwargs)
             if is_padded:
                 out = self._slice_real_outputs(out, num_real_atoms)

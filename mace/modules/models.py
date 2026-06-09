@@ -1025,7 +1025,9 @@ class AtomicDielectricMACE(torch.nn.Module):
         compute_virials: bool = False,
         compute_stress: bool = False,
         compute_displacement: bool = False,
-        compute_dielectric_derivatives: bool = False,  # no training on derivatives
+        compute_dielectric_derivatives: bool = False,
+        compute_raman_tensors: bool = True,  # skip 9 Raman VJPs when only BEC is needed
+        create_graph_for_derivatives: bool = False,  # set True only when training on BEC/Raman labels
         compute_edge_forces: bool = False,  # pylint: disable=W0613
         compute_atomic_stresses: bool = False,  # pylint: disable=W0613
     ) -> Dict[str, Optional[torch.Tensor]]:
@@ -1135,18 +1137,24 @@ class AtomicDielectricMACE(torch.nn.Module):
                 dmu_dr = compute_dielectric_gradients(
                     dielectric=total_dipole,
                     positions=data["positions"],
+                    create_graph=create_graph_for_derivatives,
                 )  # [3, N, 3]
-                dalpha_dr = compute_dielectric_gradients(
-                    dielectric=total_polarizability.flatten(-2),
-                    positions=data["positions"],
-                )  # [9, N, 3]
                 n_atoms = data["positions"].shape[0]
                 # Born effective charges: Z*[I, alpha, beta] = d mu_alpha / d R_I_beta
                 bec = dmu_dr.permute(1, 0, 2).contiguous()  # [N, 3, 3]
-                # Raman susceptibility: R[I, alpha, beta, gamma] = d alpha_alpha_beta / d R_I_gamma
-                raman_tensors = dalpha_dr.permute(1, 0, 2).contiguous().reshape(
-                    n_atoms, 3, 3, 3
-                )  # [N, 3, 3, 3]
+                if compute_raman_tensors:
+                    dalpha_dr = compute_dielectric_gradients(
+                        dielectric=total_polarizability.flatten(-2),
+                        positions=data["positions"],
+                        create_graph=create_graph_for_derivatives,
+                    )  # [9, N, 3]
+                    # Raman susceptibility: R[I, alpha, beta, gamma] = d alpha_alpha_beta / d R_I_gamma
+                    raman_tensors = dalpha_dr.permute(1, 0, 2).contiguous().reshape(
+                        n_atoms, 3, 3, 3
+                    )  # [N, 3, 3, 3]
+                else:
+                    dalpha_dr = None
+                    raman_tensors = None
             else:
                 dmu_dr = None
                 dalpha_dr = None
@@ -1157,6 +1165,7 @@ class AtomicDielectricMACE(torch.nn.Module):
                 dmu_dr = compute_dielectric_gradients(
                     dielectric=total_dipole,
                     positions=data["positions"],
+                    create_graph=create_graph_for_derivatives,
                 )  # [3, N, 3]
                 n_atoms = data["positions"].shape[0]
                 bec = dmu_dr.permute(1, 0, 2).contiguous()  # [N, 3, 3]
