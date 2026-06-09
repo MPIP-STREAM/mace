@@ -548,15 +548,22 @@ def compute_dielectric_gradients(
     dielectric_flatten = dielectric.view(-1)
     n_out = dielectric_flatten.shape[0]
 
+    # torch.func.vmap + torch.autograd.grad fails on CUDA tensors (TorchScript
+    # storage access incompatibility), so go straight to the loop on GPU.
+    if positions.is_cuda:
+        return compute_dielectric_gradients_loop(
+            dielectric, positions, create_graph=create_graph
+        )
+
     def get_vjp(v):
-        # retain_graph=False: vmap executes one batched backward, so the forward
-        # graph can be freed immediately after, preventing saved-tensor accumulation
-        # across frames. The loop fallback manages retain_graph itself.
+        # retain_graph=True: vmap calls the backward sequentially per output
+        # component (not truly batched), so the graph must survive between calls.
+        # The graph is freed when the caller (model forward) releases total_dipole.
         return torch.autograd.grad(
             dielectric_flatten,
             positions,
             v,
-            retain_graph=False,
+            retain_graph=True,
             create_graph=create_graph,
             allow_unused=False,
         )
