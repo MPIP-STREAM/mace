@@ -549,11 +549,14 @@ def compute_dielectric_gradients(
     n_out = dielectric_flatten.shape[0]
 
     def get_vjp(v):
+        # retain_graph=False: vmap executes one batched backward, so the forward
+        # graph can be freed immediately after, preventing saved-tensor accumulation
+        # across frames. The loop fallback manages retain_graph itself.
         return torch.autograd.grad(
             dielectric_flatten,
             positions,
             v,
-            retain_graph=True,
+            retain_graph=False,
             create_graph=create_graph,
             allow_unused=False,
         )
