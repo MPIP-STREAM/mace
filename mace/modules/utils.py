@@ -534,6 +534,7 @@ def compute_dielectric_gradients(
     dielectric: torch.Tensor,
     positions: torch.Tensor,
     create_graph: bool = False,
+    retain_graph_after: bool = False,
 ) -> torch.Tensor:
     """Compute Jacobian of dielectric tensor w.r.t. atomic positions via vmapped VJPs.
 
@@ -544,6 +545,9 @@ def compute_dielectric_gradients(
         create_graph: set True only when training on BEC/Raman labels (needed for
             higher-order gradients). False for inference — avoids building the
             second-order computational graph and is significantly faster.
+        retain_graph_after: set True when another gradient computation will follow
+            that needs the same forward graph (e.g. BEC followed by Raman). Keeps
+            the graph alive after the final VJP of this call.
     """
     dielectric_flatten = dielectric.view(-1)
     n_out = dielectric_flatten.shape[0]
@@ -552,7 +556,8 @@ def compute_dielectric_gradients(
     # storage access incompatibility), so go straight to the loop on GPU.
     if positions.is_cuda:
         return compute_dielectric_gradients_loop(
-            dielectric, positions, create_graph=create_graph
+            dielectric, positions, create_graph=create_graph,
+            retain_graph_after=retain_graph_after,
         )
 
     def get_vjp(v):
@@ -571,9 +576,12 @@ def compute_dielectric_gradients(
     try:
         I_N = torch.eye(n_out, dtype=positions.dtype, device=positions.device)
         gradient = torch.func.vmap(get_vjp, in_dims=0, out_dims=0)(I_N)[0]
+        # vmap uses retain_graph=True throughout (graph freed when forward() returns) —
+        # no special handling of retain_graph_after needed here.
     except RuntimeError:
         gradient = compute_dielectric_gradients_loop(
-            dielectric, positions, create_graph=create_graph
+            dielectric, positions, create_graph=create_graph,
+            retain_graph_after=retain_graph_after,
         )
     if gradient is None:
         return torch.zeros((positions.shape[0], n_out, 3))
@@ -584,6 +592,7 @@ def compute_dielectric_gradients_loop(
     dielectric: torch.Tensor,
     positions: torch.Tensor,
     create_graph: bool = False,
+    retain_graph_after: bool = False,
 ) -> torch.Tensor:
     """Serial fallback for compute_dielectric_gradients when vmap is unavailable."""
     dielectric_flatten = dielectric.view(-1)
@@ -593,7 +602,7 @@ def compute_dielectric_gradients_loop(
         hess_row = torch.autograd.grad(
             dielectric_flatten[i],
             positions,
-            retain_graph=(i < n_out - 1) or create_graph,
+            retain_graph=(i < n_out - 1) or create_graph or retain_graph_after,
             create_graph=create_graph,
             allow_unused=False,
         )[0]

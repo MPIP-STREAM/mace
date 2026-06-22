@@ -1138,6 +1138,8 @@ class AtomicDielectricMACE(torch.nn.Module):
                     dielectric=total_dipole,
                     positions=data["positions"],
                     create_graph=create_graph_for_derivatives,
+                    # keep graph alive so the Raman call can backward through it too
+                    retain_graph_after=compute_raman_tensors,
                 )  # [3, N, 3]
                 n_atoms = data["positions"].shape[0]
                 # Born effective charges: Z*[I, alpha, beta] = d mu_alpha / d R_I_beta

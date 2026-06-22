@@ -772,19 +772,22 @@ class MACECalculator(Calculator):
             for model in self.models
         ]
         dipole_derivatives = [
-            output["dmu_dr"].clone().detach().cpu().numpy() for output in outputs
+            output["bec"].clone().detach().cpu().numpy() for output in outputs
         ]
         if self.models[0].use_polarizability:
             polarizability_derivatives = [
-                output["dalpha_dr"].clone().detach().cpu().numpy() for output in outputs
+                output["raman_tensors"].clone().detach().cpu().numpy() for output in outputs
             ]
             if self.num_models == 1:
                 dipole_derivatives = dipole_derivatives[0]
                 polarizability_derivatives = polarizability_derivatives[0]
+            self.results["bec"] = dipole_derivatives
+            self.results["raman_tensors"] = polarizability_derivatives
             del outputs, batch, atoms
             return dipole_derivatives, polarizability_derivatives
         if self.num_models == 1:
-            return dipole_derivatives[0]
+            dipole_derivatives = dipole_derivatives[0]
+        self.results["bec"] = dipole_derivatives
         del outputs, batch, atoms
         return dipole_derivatives
 
