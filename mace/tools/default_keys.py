@@ -10,6 +10,7 @@ class DefaultKeys(Enum):
     VIRIALS = "REF_virials"
     DIPOLE = "dipole"
     POLARIZABILITY = "polarizability"
+    BEC = "bec"
     HEAD = "head"
     CHARGES = "REF_charges"
     TOTAL_CHARGE = "total_charge"

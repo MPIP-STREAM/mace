@@ -177,6 +177,26 @@ def weighted_mean_squared_error_polarizability(
 
 
 # ------------------------------------------------------------------------------
+# Born Effective Charge (BEC) Loss Function
+# ------------------------------------------------------------------------------
+
+
+def mean_squared_error_bec(
+    ref: Batch, pred: TensorDict, ddp: Optional[bool] = None
+) -> torch.Tensor:
+    # BEC is per-atom, shape [N, 3, 3]; per-config weights broadcast over [3, 3].
+    natoms = ref.ptr[1:] - ref.ptr[:-1]
+    configs_weight = torch.repeat_interleave(ref.weight, natoms).view(-1, 1, 1)
+    configs_bec_weight = torch.repeat_interleave(ref.bec_weight, natoms).view(-1, 1, 1)
+    raw_loss = (
+        configs_weight
+        * configs_bec_weight
+        * torch.square(ref["bec"] - pred["bec"])
+    )
+    return reduce_loss(raw_loss, ddp)
+
+
+# ------------------------------------------------------------------------------
 # Conditional Losses for Forces
 # ------------------------------------------------------------------------------
 
@@ -561,6 +581,63 @@ class DipolePolarLoss(torch.nn.Module):
         return (
             f"{self.__class__.__name__}("
             f"dipole_weight={self.dipole_weight:.3f}, polarizability_weight={self.polarizability_weight:.3f})"
+        )
+
+
+class DipolePolarBECLoss(torch.nn.Module):
+    """Dipole + polarizability + Born-effective-charge loss.
+
+    The BEC term is guarded: when ``pred["bec"]`` is ``None`` (the training loop
+    skipped the expensive second-order derivative because no config in the batch
+    carried BEC labels) it contributes exactly zero. A ``raman_weight`` slot is
+    left in place so Raman supervision can be added as a fourth term later.
+    """
+
+    def __init__(
+        self,
+        dipole_weight=1.0,
+        polarizability_weight=1.0,
+        bec_weight=1.0,
+        raman_weight=0.0,
+    ) -> None:
+        super().__init__()
+        self.register_buffer(
+            "dipole_weight",
+            torch.tensor(dipole_weight, dtype=torch.get_default_dtype()),
+        )
+        self.register_buffer(
+            "polarizability_weight",
+            torch.tensor(polarizability_weight, dtype=torch.get_default_dtype()),
+        )
+        self.register_buffer(
+            "bec_weight",
+            torch.tensor(bec_weight, dtype=torch.get_default_dtype()),
+        )
+        self.register_buffer(
+            "raman_weight",
+            torch.tensor(raman_weight, dtype=torch.get_default_dtype()),
+        )
+
+    def forward(
+        self, ref: Batch, pred: TensorDict, ddp: Optional[bool] = None
+    ) -> torch.Tensor:
+        loss_dipole = weighted_mean_squared_error_dipole(ref, pred, ddp)
+        loss_polarizability = weighted_mean_squared_error_polarizability(ref, pred, ddp)
+        total = (
+            self.dipole_weight * loss_dipole
+            + self.polarizability_weight * loss_polarizability
+        )
+        if pred.get("bec", None) is not None:
+            total = total + self.bec_weight * mean_squared_error_bec(ref, pred, ddp)
+        # raman_weight slot: add self.raman_weight * mean_squared_error_raman(...) here.
+        return total
+
+    def __repr__(self):
+        return (
+            f"{self.__class__.__name__}("
+            f"dipole_weight={self.dipole_weight:.3f}, "
+            f"polarizability_weight={self.polarizability_weight:.3f}, "
+            f"bec_weight={self.bec_weight:.3f})"
         )
 
 

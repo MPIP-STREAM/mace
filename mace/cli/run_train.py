@@ -551,6 +551,9 @@ def run(args) -> None:
         args.compute_virials = False
         args.compute_stress = False
         args.compute_polarizability = True
+        # Enable direct BEC supervision when a BEC loss is selected. BEC derives
+        # from the dipole head, so dipole+polarizability stay on.
+        args.compute_bec = args.loss == "dipole_polar_bec"
     else:
         dipole_only = False
         if args.model == "EnergyDipolesMACE":
@@ -965,6 +968,7 @@ def run(args) -> None:
         plotter=plotter,
         train_sampler=train_sampler,
         rank=rank,
+        start_bec_epoch=getattr(args, "start_bec_epoch", 0),
     )
 
     logging.info("")

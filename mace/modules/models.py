@@ -1142,17 +1142,31 @@ class AtomicDielectricMACE(torch.nn.Module):
                     retain_graph_after=compute_raman_tensors,
                 )  # [3, N, 3]
                 n_atoms = data["positions"].shape[0]
-                # Born effective charges: Z*[I, alpha, beta] = d mu_alpha / d R_I_beta
-                bec = dmu_dr.permute(1, 0, 2).contiguous()  # [N, 3, 3]
+                # Born effective charges: Z*[I, alpha, beta] = d mu_alpha / d R_I_beta.
+                # With a batched input, dmu_dr is [3*n_graphs, N, 3] (one VJP per
+                # (graph, dipole-component)). Cross-graph blocks are structurally
+                # zero (separate graphs share no edges), so summing over the graph
+                # axis selects each atom's own-graph block. Reduces to permute when
+                # n_graphs == 1 (inference), preserving the single-graph result.
+                bec = (
+                    dmu_dr.view(num_graphs, 3, n_atoms, 3)
+                    .sum(dim=0)
+                    .permute(1, 0, 2)
+                    .contiguous()
+                )  # [N, 3, 3]
                 if compute_raman_tensors:
                     dalpha_dr = compute_dielectric_gradients(
                         dielectric=total_polarizability.flatten(-2),
                         positions=data["positions"],
                         create_graph=create_graph_for_derivatives,
-                    )  # [9, N, 3]
+                    )  # [9*n_graphs, N, 3]
                     # Raman susceptibility: R[I, alpha, beta, gamma] = d alpha_alpha_beta / d R_I_gamma
-                    raman_tensors = dalpha_dr.permute(1, 0, 2).contiguous().reshape(
-                        n_atoms, 3, 3, 3
+                    raman_tensors = (
+                        dalpha_dr.view(num_graphs, 9, n_atoms, 3)
+                        .sum(dim=0)
+                        .permute(1, 0, 2)
+                        .contiguous()
+                        .reshape(n_atoms, 3, 3, 3)
                     )  # [N, 3, 3, 3]
                 else:
                     dalpha_dr = None
@@ -1168,9 +1182,16 @@ class AtomicDielectricMACE(torch.nn.Module):
                     dielectric=total_dipole,
                     positions=data["positions"],
                     create_graph=create_graph_for_derivatives,
-                )  # [3, N, 3]
+                )  # [3*n_graphs, N, 3]
                 n_atoms = data["positions"].shape[0]
-                bec = dmu_dr.permute(1, 0, 2).contiguous()  # [N, 3, 3]
+                # Sum over the graph axis selects each atom's own-graph block
+                # (cross-graph blocks are zero); identity for n_graphs == 1.
+                bec = (
+                    dmu_dr.view(num_graphs, 3, n_atoms, 3)
+                    .sum(dim=0)
+                    .permute(1, 0, 2)
+                    .contiguous()
+                )  # [N, 3, 3]
             else:
                 dmu_dr = None
                 bec = None

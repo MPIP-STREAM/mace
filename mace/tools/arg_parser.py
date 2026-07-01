@@ -435,6 +435,20 @@ def build_default_arg_parser() -> argparse.ArgumentParser:
         type=str2bool,
         default=False,
     )
+    parser.add_argument(
+        "--compute_bec",
+        help="Select True to supervise Born effective charges (BEC) during training "
+        "(AtomicDielectricMACE). Usually set automatically by the dipole_polar_bec loss.",
+        type=str2bool,
+        default=False,
+    )
+    parser.add_argument(
+        "--start_bec_epoch",
+        help="Epoch at which BEC supervision turns on within a run (delays the "
+        "expensive second-order graph; 0 = from the start).",
+        type=int,
+        default=0,
+    )
 
     # Dataset
     parser.add_argument(
@@ -694,6 +708,13 @@ def build_default_arg_parser() -> argparse.ArgumentParser:
         default=DefaultKeys.POLARIZABILITY.value,
     )
     parser.add_argument(
+        "--bec_key",
+        help="Key of per-atom Born effective charges (BEC) in training xyz arrays "
+        "(9 columns per atom, row-major flatten of d(mu_a)/d(R_b))",
+        type=str,
+        default=DefaultKeys.BEC.value,
+    )
+    parser.add_argument(
         "--head_key",
         help="Key of head in training xyz",
         type=str,
@@ -766,6 +787,7 @@ def build_default_arg_parser() -> argparse.ArgumentParser:
             "stress",
             "dipole",
             "dipole_polar",
+            "dipole_polar_bec",
             "huber",
             "universal",
             "energy_forces_dipole",
@@ -838,6 +860,12 @@ def build_default_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--polarizability_weight",
         help="weight of polarizability loss",
+        type=float,
+        default=1.0,
+    )
+    parser.add_argument(
+        "--bec_weight",
+        help="weight of Born-effective-charge (BEC) loss",
         type=float,
         default=1.0,
     )
@@ -1210,6 +1238,12 @@ def build_preprocess_arg_parser() -> argparse.ArgumentParser:
         help="Key of polarizability in training xyz",
         type=str,
         default=DefaultKeys.POLARIZABILITY.value,
+    )
+    parser.add_argument(
+        "--bec_key",
+        help="Key of per-atom Born effective charges (BEC) in training xyz arrays",
+        type=str,
+        default=DefaultKeys.BEC.value,
     )
     parser.add_argument(
         "--charges_key",

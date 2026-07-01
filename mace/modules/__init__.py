@@ -27,6 +27,7 @@ from .blocks import (
 from .extensions import PolarMACE
 from .gate import GatedEquivariantBlock
 from .loss import (
+    DipolePolarBECLoss,
     DipolePolarLoss,
     DipoleSingleLoss,
     UniversalLoss,
@@ -117,6 +118,7 @@ __all__ = [
     "WeightedEnergyForcesVirialsLoss",
     "WeightedEnergyForcesStressLoss",
     "DipoleSingleLoss",
+    "DipolePolarBECLoss",
     "WeightedEnergyForcesDipoleLoss",
     "WeightedHuberEnergyForcesStressLoss",
     "UniversalLoss",

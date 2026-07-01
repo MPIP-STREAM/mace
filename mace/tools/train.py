@@ -172,6 +172,7 @@ def train(
     distributed_model: Optional[DistributedDataParallel] = None,
     train_sampler: Optional[DistributedSampler] = None,
     rank: Optional[int] = 0,
+    start_bec_epoch: int = 0,
 ):
     lowest_loss = np.inf
     valid_loss = np.inf
@@ -243,6 +244,7 @@ def train(
             distributed=distributed,
             distributed_model=distributed_model,
             rank=rank,
+            start_bec_epoch=start_bec_epoch,
         )
         if distributed:
             torch.distributed.barrier()
@@ -361,8 +363,14 @@ def train_one_epoch(
     distributed: bool,
     distributed_model: Optional[DistributedDataParallel] = None,
     rank: Optional[int] = 0,
+    start_bec_epoch: int = 0,
 ) -> None:
     model_to_train = model if distributed_model is None else distributed_model
+
+    # Delayed-onset BEC supervision: keep the (expensive) second-order graph off
+    # until `start_bec_epoch`, so a single run can pretrain dipole+polar first.
+    if output_args.get("bec", False) and epoch < start_bec_epoch:
+        output_args = {**output_args, "bec": False}
 
     if isinstance(optimizer, LBFGS):
         _, opt_metrics = take_step_lbfgs(
@@ -399,6 +407,29 @@ def train_one_epoch(
                 logger.log(opt_metrics)
 
 
+def bec_model_kwargs(
+    output_args: Dict[str, bool], batch, training: bool
+) -> Dict[str, bool]:
+    """Extra forward() kwargs to enable BEC derivatives only when needed.
+
+    Returns an empty dict (so non-dielectric models are unaffected) unless BEC
+    training is enabled AND the batch actually carries BEC labels. The expensive
+    ``create_graph`` second-order graph is built only during training, so
+    ``loss.backward()`` can propagate through the dipole-position VJP back to the
+    model parameters. Raman is never requested here (avoids 9 extra VJPs).
+    """
+    if not output_args.get("bec", False):
+        return {}
+    has_bec = getattr(batch, "bec_weight", None) is not None and bool(
+        (batch.bec_weight > 0).any()
+    )
+    return {
+        "compute_dielectric_derivatives": has_bec,
+        "create_graph_for_derivatives": has_bec and training,
+        "compute_raman_tensors": False,
+    }
+
+
 def take_step(
     model: torch.nn.Module,
     loss_fn: torch.nn.Module,
@@ -421,6 +452,7 @@ def take_step(
             compute_force=output_args["forces"],
             compute_virials=output_args["virials"],
             compute_stress=output_args["stress"],
+            **bec_model_kwargs(output_args, batch, training=True),
         )
         loss = loss_fn(pred=output, ref=batch)
         loss.backward()
@@ -495,6 +527,7 @@ def take_step_lbfgs(
                 compute_force=output_args["forces"],
                 compute_virials=output_args["virials"],
                 compute_stress=output_args["stress"],
+                **bec_model_kwargs(output_args, batch, training=True),
             )
             batch_loss = loss_fn(pred=output, ref=batch)
             batch_loss = batch_loss * (batch.num_graphs / total_sample_count)
@@ -577,6 +610,7 @@ def evaluate(
                 compute_force=output_args["forces"],
                 compute_virials=output_args["virials"],
                 compute_stress=output_args["stress"],
+                **bec_model_kwargs(output_args, batch, training=False),
             )
             avg_loss, aux = metrics(batch, output)
     avg_loss, aux = metrics.compute()

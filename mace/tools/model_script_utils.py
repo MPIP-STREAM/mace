@@ -46,6 +46,7 @@ def configure_model(
         "stress": compute_stress,
         "dipoles": args.compute_dipole,
         "polarizabilities": args.compute_polarizability,
+        "bec": getattr(args, "compute_bec", False),
     }
     logging.info(
         f"During training the following quantities will be reported: {', '.join([f'{report}' for report, value in output_args.items() if value])}"
@@ -364,9 +365,10 @@ def _build_model(
     if args.model == "AtomicDielectricMACE":
         args.error_table = "DipolePolarRMSE"
         # std_df = modules.scaling_classes["rms_dipoles_scaling"](train_loader)
-        assert (
-            args.loss == "dipole_polar"
-        ), "Use dipole_polar loss with AtomicDielectricMACE model"
+        assert args.loss in (
+            "dipole_polar",
+            "dipole_polar_bec",
+        ), "Use dipole_polar or dipole_polar_bec loss with AtomicDielectricMACE model"
         assert args.error_table in (
             "DipoleRMSE",
             "DipolePolarRMSE",
