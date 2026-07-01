@@ -715,6 +715,7 @@ def get_loss_fn(
             dipole_weight=args.dipole_weight,
             polarizability_weight=args.polarizability_weight,
             bec_weight=args.bec_weight,
+            bec_loss_eps=getattr(args, "bec_loss_eps", 0.0),
         )
     elif args.loss == "energy_forces_dipole":
         assert dipole_only is False and compute_dipole is True

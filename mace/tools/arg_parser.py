@@ -870,6 +870,18 @@ def build_default_arg_parser() -> argparse.ArgumentParser:
         default=1.0,
     )
     parser.add_argument(
+        "--bec_loss_eps",
+        help=(
+            "noise floor for a per-element RELATIVE BEC loss: "
+            "raw = (ref-pred)^2 / (ref^2 + eps^2). 0 (default) keeps the plain "
+            "MSE. Set >0 (near the finite-difference BEC noise level, e.g. ~1e-2 e) "
+            "to force fitting the small molecular-frame components (e.g. orthogonal "
+            "to the OH bond) without chasing label noise."
+        ),
+        type=float,
+        default=0.0,
+    )
+    parser.add_argument(
         "--config_type_weights",
         help="String of dictionary containing the weights for each config type",
         type=str,

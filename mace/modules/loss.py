@@ -196,6 +196,34 @@ def mean_squared_error_bec(
     return reduce_loss(raw_loss, ddp)
 
 
+def relative_error_bec(
+    ref: Batch,
+    pred: TensorDict,
+    eps: float = 1e-2,
+    ddp: Optional[bool] = None,
+) -> torch.Tensor:
+    """Per-element relative-error BEC loss with a noise floor ``eps``.
+
+        raw = w * (ref - pred)^2 / (ref^2 + eps^2)
+
+    Unlike the plain MSE, this balances the loss across tensor elements
+    *regardless of lab-frame orientation*, so it forces the model to fit the
+    small molecular-frame components (e.g. the direction orthogonal to an OH
+    bond) that the MSE lets the dominant along-bond component drown out.
+
+    ``eps`` acts as a noise floor: for |ref| << eps the denominator is ~eps^2
+    (behaving like a scaled MSE), so finite-difference label noise in the tiny
+    elements is not amplified. Choose ``eps`` near the FD BEC noise level.
+    """
+    natoms = ref.ptr[1:] - ref.ptr[:-1]
+    configs_weight = torch.repeat_interleave(ref.weight, natoms).view(-1, 1, 1)
+    configs_bec_weight = torch.repeat_interleave(ref.bec_weight, natoms).view(-1, 1, 1)
+    diff = ref["bec"] - pred["bec"]
+    denom = torch.square(ref["bec"]) + eps * eps
+    raw_loss = configs_weight * configs_bec_weight * torch.square(diff) / denom
+    return reduce_loss(raw_loss, ddp)
+
+
 # ------------------------------------------------------------------------------
 # Conditional Losses for Forces
 # ------------------------------------------------------------------------------
@@ -599,8 +627,12 @@ class DipolePolarBECLoss(torch.nn.Module):
         polarizability_weight=1.0,
         bec_weight=1.0,
         raman_weight=0.0,
+        bec_loss_eps=0.0,
     ) -> None:
         super().__init__()
+        # bec_loss_eps > 0 switches the BEC term from plain MSE to a per-element
+        # relative-error loss with noise floor eps (see relative_error_bec).
+        self.bec_loss_eps = float(bec_loss_eps)
         self.register_buffer(
             "dipole_weight",
             torch.tensor(dipole_weight, dtype=torch.get_default_dtype()),
@@ -628,7 +660,11 @@ class DipolePolarBECLoss(torch.nn.Module):
             + self.polarizability_weight * loss_polarizability
         )
         if pred.get("bec", None) is not None:
-            total = total + self.bec_weight * mean_squared_error_bec(ref, pred, ddp)
+            if self.bec_loss_eps > 0.0:
+                loss_bec = relative_error_bec(ref, pred, self.bec_loss_eps, ddp)
+            else:
+                loss_bec = mean_squared_error_bec(ref, pred, ddp)
+            total = total + self.bec_weight * loss_bec
         # raman_weight slot: add self.raman_weight * mean_squared_error_raman(...) here.
         return total
 
@@ -637,7 +673,8 @@ class DipolePolarBECLoss(torch.nn.Module):
             f"{self.__class__.__name__}("
             f"dipole_weight={self.dipole_weight:.3f}, "
             f"polarizability_weight={self.polarizability_weight:.3f}, "
-            f"bec_weight={self.bec_weight:.3f})"
+            f"bec_weight={self.bec_weight:.3f}, "
+            f"bec_loss_eps={self.bec_loss_eps:.3g})"
         )
 
 

@@ -19,7 +19,11 @@ from ase import Atoms
 
 from mace import data
 from mace.calculators import MACECalculator
-from mace.modules.loss import DipolePolarBECLoss, mean_squared_error_bec
+from mace.modules.loss import (
+    DipolePolarBECLoss,
+    mean_squared_error_bec,
+    relative_error_bec,
+)
 from mace.tools import torch_geometric, utils
 
 run_train = Path(__file__).parent.parent / "mace" / "cli" / "run_train.py"
@@ -131,6 +135,50 @@ def test_dipole_polar_bec_loss_guards_missing_bec():
 
     pred["bec"] = ref["bec"].clone() + 1.0
     assert float(loss_fn(ref, pred)) > 0.0
+
+
+def test_relative_error_bec_zero_when_exact():
+    ref = _batch(_water(with_bec=True, seed=7))
+    pred = {"bec": ref["bec"].clone()}
+    assert float(relative_error_bec(ref, pred, eps=1e-2)) == pytest.approx(0.0)
+
+
+def test_relative_error_bec_upweights_small_components():
+    # A fixed absolute error on a SMALL reference element must count for more,
+    # under the relative loss, than the SAME absolute error on a LARGE element.
+    ref = _batch(_water(with_bec=False, seed=8))  # weight applied manually below
+    ref.bec_weight = torch.ones_like(ref.bec_weight)
+    big = ref["bec"].clone()
+    small = ref["bec"].clone()
+    big[0, 0, 0] = 10.0
+    small[0, 0, 0] = 0.1
+    delta = 0.05
+
+    # same absolute error delta on the [0,0,0] element in each case
+    pred_big = {"bec": big.clone()}
+    pred_big["bec"][0, 0, 0] += delta
+    pred_small = {"bec": small.clone()}
+    pred_small["bec"][0, 0, 0] += delta
+
+    ref.bec = big
+    loss_big = float(relative_error_bec(ref, pred_big, eps=1e-3))
+    ref.bec = small
+    loss_small = float(relative_error_bec(ref, pred_small, eps=1e-3))
+    # small-reference element contributes a much larger relative loss
+    assert loss_small > loss_big
+
+
+def test_relative_error_bec_eps_caps_noise():
+    # For |ref| << eps the denominator ~ eps^2, so the relative loss reduces to
+    # a scaled MSE and does not blow up as ref -> 0.
+    ref = _batch(_water(with_bec=False, seed=9))
+    ref.bec_weight = torch.ones_like(ref.bec_weight)
+    ref.bec = torch.zeros_like(ref.bec)
+    pred = {"bec": torch.full_like(ref.bec, 0.01)}
+    eps = 1.0
+    got = float(relative_error_bec(ref, pred, eps=eps))
+    # every element error^2 / eps^2 = 1e-4, averaged -> 1e-4
+    assert got == pytest.approx(1e-4, rel=1e-6)
 
 
 # ---------------------------------------------------------------------------
