@@ -134,9 +134,22 @@ def valid_err_log(
     elif log_errors == "DipolePolarRMSE":
         error_mu = eval_metrics["rmse_mu_per_atom"] * 1e3
         error_polarizability = eval_metrics["rmse_polarizability_per_atom"] * 1e3
-        logging.info(
-            f"{inintial_phrase}: head: {valid_loader_name}, loss={valid_loss:.4f}, RMSE_MU_per_atom={error_mu:.2f} me A, RMSE_polarizability_per_atom={error_polarizability:.2f} me A^2 / V",
+        line = (
+            f"{inintial_phrase}: head: {valid_loader_name}, loss={valid_loss:.4f}, "
+            f"RMSE_MU_per_atom={error_mu:.2f} me A, "
+            f"RMSE_polarizability_per_atom={error_polarizability:.2f} me A^2 / V"
         )
+        if eval_metrics.get("rmse_bec") is not None:
+            error_bec = eval_metrics["rmse_bec"] * 1e3
+            line += f", RMSE_BEC={error_bec:.2f} me"
+        if eval_metrics.get("pct_loss_dipole") is not None:
+            line += (
+                f", loss%[mu/pol/bec]="
+                f"{eval_metrics['pct_loss_dipole']:.0f}/"
+                f"{eval_metrics['pct_loss_polarizability']:.0f}/"
+                f"{eval_metrics['pct_loss_bec']:.0f}"
+            )
+        logging.info(line)
     elif log_errors == "EnergyDipoleRMSE":
         error_e = eval_metrics["rmse_e_per_atom"] * 1e3
         error_f = eval_metrics["rmse_f"] * 1e3
@@ -652,9 +665,31 @@ class MACELoss(Metric):
         self.add_state(
             "delta_polarizability_per_atom", default=[], dist_reduce_fx="cat"
         )
+        self.add_state("Bec_computed", default=torch.tensor(0.0), dist_reduce_fx="sum")
+        self.add_state("delta_bec", default=[], dist_reduce_fx="cat")
+        # Per-term weighted-loss sums, used to report each component's share (%)
+        # of the total loss. Only populated when loss_fn exposes component_losses.
+        self.add_state("sum_loss_dipole", default=torch.tensor(0.0), dist_reduce_fx="sum")
+        self.add_state("sum_loss_polar", default=torch.tensor(0.0), dist_reduce_fx="sum")
+        self.add_state("sum_loss_bec", default=torch.tensor(0.0), dist_reduce_fx="sum")
 
     def update(self, batch, output):  # pylint: disable=arguments-differ
-        loss = self.loss_fn(pred=output, ref=batch)
+        if hasattr(self.loss_fn, "component_losses"):
+            comps = self.loss_fn.component_losses(pred=output, ref=batch)
+            loss = None
+            for term in comps.values():
+                loss = term if loss is None else loss + term
+            self.sum_loss_dipole += comps.get(
+                "dipole", torch.zeros((), device=self.total_loss.device)
+            ).detach()
+            self.sum_loss_polar += comps.get(
+                "polarizability", torch.zeros((), device=self.total_loss.device)
+            ).detach()
+            self.sum_loss_bec += comps.get(
+                "bec", torch.zeros((), device=self.total_loss.device)
+            ).detach()
+        else:
+            loss = self.loss_fn(pred=output, ref=batch)
         self.total_loss += loss
         self.num_data += batch.num_graphs
 
@@ -721,6 +756,17 @@ class MACELoss(Metric):
                 batch.weight,
                 batch.polarizability_weight,
                 spread_quantity_vector=False,
+            )
+        if output.get("bec") is not None and getattr(batch, "bec", None) is not None:
+            # BEC is per-atom [N, 3, 3]; filter out configs without BEC labels
+            # (bec_weight == 0) so they don't pollute RMSE_BEC.
+            self.delta_bec.append(batch.bec - output["bec"])
+            self.Bec_computed += filter_nonzero_weight(
+                batch,
+                self.delta_bec,
+                batch.weight,
+                batch.bec_weight,
+                spread_atoms=True,
             )
 
     def convert(self, delta: Union[torch.Tensor, List[torch.Tensor]]) -> np.ndarray:
@@ -798,5 +844,21 @@ class MACELoss(Metric):
                 delta_polarizability_per_atom
             )
             aux["q95_polarizability"] = compute_q95(delta_polarizability)
+        if self.Bec_computed:
+            delta_bec = self.convert(self.delta_bec)
+            aux["mae_bec"] = compute_mae(delta_bec)
+            aux["rmse_bec"] = compute_rmse(delta_bec)
+        # Per-component share (%) of the total loss (weighted terms).
+        total_terms = self.sum_loss_dipole + self.sum_loss_polar + self.sum_loss_bec
+        if to_numpy(total_terms).item() > 0.0:
+            aux["pct_loss_dipole"] = to_numpy(
+                100.0 * self.sum_loss_dipole / total_terms
+            ).item()
+            aux["pct_loss_polarizability"] = to_numpy(
+                100.0 * self.sum_loss_polar / total_terms
+            ).item()
+            aux["pct_loss_bec"] = to_numpy(
+                100.0 * self.sum_loss_bec / total_terms
+            ).item()
 
         return aux["loss"], aux

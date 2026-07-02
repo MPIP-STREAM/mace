@@ -4,7 +4,7 @@
 # This program is distributed under the MIT License (see MIT.md)
 ###########################################################################################
 
-from typing import Optional
+from typing import Dict, Optional
 
 import torch
 import torch.distributed as dist
@@ -650,22 +650,37 @@ class DipolePolarBECLoss(torch.nn.Module):
             torch.tensor(raman_weight, dtype=torch.get_default_dtype()),
         )
 
-    def forward(
+    def component_losses(
         self, ref: Batch, pred: TensorDict, ddp: Optional[bool] = None
-    ) -> torch.Tensor:
-        loss_dipole = weighted_mean_squared_error_dipole(ref, pred, ddp)
-        loss_polarizability = weighted_mean_squared_error_polarizability(ref, pred, ddp)
-        total = (
-            self.dipole_weight * loss_dipole
-            + self.polarizability_weight * loss_polarizability
-        )
+    ) -> Dict[str, torch.Tensor]:
+        """Return each term already multiplied by its weight.
+
+        The values sum to exactly ``forward()``. Used by the metrics logger to
+        report each component's share (%) of the total loss. The ``bec`` key is
+        present only when ``pred["bec"]`` is available (i.e. the batch carried
+        BEC labels and the second-order derivative was computed).
+        """
+        comps: Dict[str, torch.Tensor] = {
+            "dipole": self.dipole_weight
+            * weighted_mean_squared_error_dipole(ref, pred, ddp),
+            "polarizability": self.polarizability_weight
+            * weighted_mean_squared_error_polarizability(ref, pred, ddp),
+        }
         if pred.get("bec", None) is not None:
             if self.bec_loss_eps > 0.0:
                 loss_bec = relative_error_bec(ref, pred, self.bec_loss_eps, ddp)
             else:
                 loss_bec = mean_squared_error_bec(ref, pred, ddp)
-            total = total + self.bec_weight * loss_bec
-        # raman_weight slot: add self.raman_weight * mean_squared_error_raman(...) here.
+            comps["bec"] = self.bec_weight * loss_bec
+        # raman_weight slot: comps["raman"] = self.raman_weight * ... here.
+        return comps
+
+    def forward(
+        self, ref: Batch, pred: TensorDict, ddp: Optional[bool] = None
+    ) -> torch.Tensor:
+        total = None
+        for term in self.component_losses(ref, pred, ddp).values():
+            total = term if total is None else total + term
         return total
 
     def __repr__(self):

@@ -2,7 +2,9 @@
 
 ## Project overview
 
-Fork of [ACEsuit/mace](https://github.com/ACEsuit/mace). Active branch: `MDP-derivatives-with-bec_training`. The `DipolePolarizabilityMACE` model type (`AtomicDielectricMACE` class) computes dipole, polarizability, Born Effective Charges (BEC), and Raman tensors. Current work: add BEC (and possibly Raman) training support, i.e. supervise the model on BEC labels.
+Fork of [ACEsuit/mace](https://github.com/ACEsuit/mace). Active branch: `MDP-derivatives-with-bec_training`. The `DipolePolarizabilityMACE` model type (`AtomicDielectricMACE` class) computes dipole, polarizability, Born Effective Charges (BEC), and Raman tensors.
+
+**Direct BEC training is implemented** (data pipeline + loss + training-loop wiring + CLI). Current work is **accuracy tuning**, driven by an SFG problem: IR/Raman are good but SFG is poor because the dipole derivative in the molecular-frame direction **orthogonal to the OH bond** is under-fit. Levers added for this: a relative BEC loss (`--bec_loss_eps`), per-component loss logging, and bond-frame (∥/⊥) BEC diagnostics. Raman training is still future work (a slot is left in the loss).
 
 ---
 
@@ -12,16 +14,19 @@ Fork of [ACEsuit/mace](https://github.com/ACEsuit/mace). Active branch: `MDP-der
 |---|---|
 | `mace/modules/utils.py` | `compute_dielectric_gradients`, `compute_dielectric_gradients_loop`, `compute_bec_sparse` (placeholder) |
 | `mace/modules/models.py` | `AtomicDielectricMACE.forward()` — the model |
-| `mace/modules/loss.py` | All loss classes; `DipolePolarLoss` is current loss for this model |
-| `mace/data/atomic_data.py` | `AtomicData` — per-config data class; defines what labels exist in the pipeline |
-| `mace/data/utils.py` | Data loading from xyz files into `AtomicData` |
-| `mace/tools/model_script_utils.py` | `configure_model()` — builds `output_args` dict that controls what the model computes during training |
-| `mace/tools/train.py` | `take_step()`, `train_one_epoch()` — training loop; calls `model(batch_dict, training=True, **output_args)` then `loss.backward()` |
+| `mace/modules/loss.py` | Loss classes. `DipolePolarBECLoss` (`--loss dipole_polar_bec`) is the BEC-training loss; `mean_squared_error_bec` + `relative_error_bec`; `DipolePolarLoss` is the dipole+polar-only loss |
+| `mace/data/atomic_data.py` | `AtomicData` — per-config data class; holds `bec` `[N,3,3]` + `bec_weight` |
+| `mace/data/utils.py` | Data loading from xyz files into `AtomicData`; `bec` read from per-atom `arrays` (`--bec_key`) |
+| `mace/tools/model_script_utils.py` | `configure_model()` — builds `output_args` (incl. `"bec"`) that controls what the model computes during training |
+| `mace/tools/train.py` | Training loop; `bec_model_kwargs()` gates BEC derivatives; `MACELoss` metric computes `rmse_bec` + per-component loss %; `train()` has `start_bec_epoch` staging |
 | `mace/tools/scripts_utils.py` | `get_loss_fn()` — selects loss based on `args.loss` string |
-| `mace/cli/run_train.py` | Training entry point; sets `args.compute_dipole`, `args.compute_polarizability`, etc. for `AtomicDielectricMACE` |
+| `mace/cli/run_train.py` | Training entry point; sets `args.compute_dipole/polarizability/bec` for `AtomicDielectricMACE` |
 | `mace/calculators/mace.py` | `MACECalculator` — inference; `get_dielectric_derivatives()` |
+| `AUX/eval_all_splits.py` | Post-training eval → writes `MACE_*`/`REF_*` (incl. per-atom `bec` via `--compute_bec`) to `*.out.xyz` |
+| `AUX/plot_eval.py` | Parity plots: `dipole`/`polarizability`/`energy`/`bec`; `--project-oh` adds the bond-frame ∥/⊥ decomposition |
+| `tests/test_bec_training.py` | BEC data round-trip, loss (MSE/relative/masking/guard), end-to-end CLI training |
 | `tests/test_calculator.py` | `test_calculator_bec_raman`, `test_calculator_bec_raman_via_get_property` |
-| `tests/test_polar_models.py` | Training-path tests for DipolePolarizabilityMACE |
+| `tests/test_polar_models.py` | Training-path tests for DipolePolarizabilityMACE (skipped locally: `graph_longrange` not installed) |
 
 ---
 
@@ -55,7 +60,7 @@ def forward(
 
 ## Training infrastructure
 
-### How the training loop calls the model (train.py ~line 418)
+### How the training loop calls the model (train.py, `take_step`/`evaluate`)
 
 ```python
 output = model(
@@ -64,110 +69,75 @@ output = model(
     compute_force=output_args["forces"],
     compute_virials=output_args["virials"],
     compute_stress=output_args["stress"],
+    **bec_model_kwargs(output_args, batch, training=True),  # BEC derivative gate
 )
 loss = loss_fn(pred=output, ref=batch)
 loss.backward()
 ```
 
-`output_args` is built in `configure_model()` (model_script_utils.py ~line 42):
+`output_args` is built in `configure_model()` (model_script_utils.py) and **includes `"bec"`**:
 ```python
 output_args = {
-    "energy": args.compute_energy,
-    "forces": args.compute_forces,
-    "virials": compute_virials,
-    "stress": compute_stress,
+    "energy": ..., "forces": ..., "virials": ..., "stress": ...,
     "dipoles": args.compute_dipole,
     "polarizabilities": args.compute_polarizability,
+    "bec": getattr(args, "compute_bec", False),
 }
 ```
 
-Currently there is **no `bec` or `raman` in `output_args`**, and `compute_dielectric_derivatives` / `create_graph_for_derivatives` are never passed during training. This is what needs to be added.
+`bec_model_kwargs(output_args, batch, training)` (train.py) returns `{}` unless BEC is on **and** the batch actually carries labels (`(batch.bec_weight > 0).any()`), else:
+```python
+{"compute_dielectric_derivatives": True,
+ "create_graph_for_derivatives": training,   # second-order graph only while training
+ "compute_raman_tensors": False}             # no Raman training yet
+```
+So the expensive second-order VJP is built **only** on batches with BEC labels, and only during training (eval computes BEC with `create_graph=False`). Wired into `take_step`, `take_step_lbfgs`, and `evaluate`.
 
-### How `AtomicDielectricMACE` is identified in run_train.py (~line 545)
+### How `AtomicDielectricMACE` is identified in run_train.py
 
 ```python
 elif args.model == "AtomicDielectricMACE":
-    atomic_energies = None
-    dipole_only = False
     args.compute_dipole = True
     args.compute_polarizability = True
     args.compute_energy = False
     args.compute_forces = False
+    args.compute_bec = args.loss == "dipole_polar_bec"   # enables BEC training
     ...
 ```
+`tools.train(..., start_bec_epoch=getattr(args, "start_bec_epoch", 0))` allows delayed BEC onset.
 
 Note: the CLI arg is `--model AtomicDielectricMACE` but the calculator uses `model_type="DipolePolarizabilityMACE"`.
 
-### Existing loss functions (loss.py)
+### Loss functions for this model (loss.py)
 
-The current loss for this model type is `DipolePolarLoss` (selected by `--loss dipole_polar`):
-```python
-class DipolePolarLoss(torch.nn.Module):
-    def forward(self, ref: Batch, pred: TensorDict, ...) -> torch.Tensor:
-        loss_dipole = weighted_mean_squared_error_dipole(ref, pred)          # MSE on dipole [n_graphs, 3]
-        loss_polarizability = weighted_mean_squared_error_polarizability(ref, pred)  # MSE on [n_graphs, 3, 3]
-        return dipole_weight * loss_dipole + polarizability_weight * loss_polarizability
-```
+- `DipolePolarLoss` (`--loss dipole_polar`): dipole + polarizability MSE. Still valid for non-BEC runs.
+- **`DipolePolarBECLoss` (`--loss dipole_polar_bec`)**: adds a BEC term. Key points:
+  - **BEC term is guarded**: if `pred["bec"] is None` (batch had no labels → derivatives skipped) it contributes 0.
+  - `component_losses(ref, pred)` returns each **weighted** term (`dipole`, `polarizability`, `bec`); `forward()` just sums it — used by the metric to report per-component loss %.
+  - `bec_loss_eps` (CLI `--bec_loss_eps`, default 0) selects the BEC loss form:
+    - `0` → `mean_squared_error_bec` (plain MSE, dominated by the large along-bond element).
+    - `>0` → `relative_error_bec`: `w·(ref−pred)² / (ref² + eps²)`. Balances tensor elements **in any frame**, forcing the small molecular-frame ⊥-to-OH component to be fit; `eps` is a noise floor (set near the finite-difference BEC noise, ~1e-2 e) so tiny/noisy elements aren't chased. **This is the main lever for the SFG accuracy problem.**
+  - `raman_weight` slot left for future Raman supervision.
+- Both `mean_squared_error_bec` and `relative_error_bec` weight per-config via `bec_weight` (0 for unlabeled configs → subset training works automatically).
 
-The pattern for a BEC loss would follow `mean_squared_error_forces` (forces are also per-atom, shape `[N, 3]`):
-```python
-def mean_squared_error_forces(ref, pred, ddp=None):
-    configs_weight = torch.repeat_interleave(ref.weight, ref.ptr[1:] - ref.ptr[:-1]).unsqueeze(-1)
-    configs_forces_weight = torch.repeat_interleave(ref.forces_weight, ...).unsqueeze(-1)
-    raw_loss = configs_weight * configs_forces_weight * torch.square(ref["forces"] - pred["forces"])
-    return reduce_loss(raw_loss, ddp)
-```
+### Data pipeline — BEC labels (implemented)
 
-BEC has shape `[N, 3, 3]` — similar per-atom structure but 3×3 instead of 3.
+`AtomicData` holds:
+- `dipole` `[,3]` (per-graph, `REF_dipole`), `polarizability` `[1,3,3]` (per-graph, `REF_polarizability`)
+- **`bec` `[N,3,3]` + scalar `bec_weight`** — per-atom, read from xyz `arrays` under `--bec_key` (e.g. `REF_bec`, stored `[N,9]` row-major → reshaped to `[N,3,3]`). Batches concatenate along the atom axis like `forces`.
+- **Subset labeling is automatic**: `config_from_atoms` sets `bec_weight = 0` when the array is absent, so only labeled configs contribute (and trigger the expensive derivative).
 
-### Data pipeline — what labels exist today (atomic_data.py)
+### Training-log fields (DipolePolarRMSE error table)
 
-`AtomicData.__init__` currently accepts (relevant subset):
-- `dipole` `[, 3]` — per-graph total dipole (label key: `REF_dipole`)
-- `polarizability` `[1, 3, 3]` — per-graph polarizability (label key: `REF_polarizability`)
-- `forces` `[N, 3]` — per-atom forces
-
-**BEC labels do not yet exist in the data pipeline.** Adding them requires:
-1. A new field `bec: Optional[torch.Tensor]  # [N, 3, 3]` and `bec_weight` in `AtomicData`
-2. Data loading in `data/utils.py` to read BEC from xyz `arrays` (per-atom, not `info`)
-3. The batching machinery handles per-atom tensors automatically (same as forces)
-
----
-
-## What needs to be implemented for BEC training
-
-### Minimum viable path
-
-1. **Data pipeline** (`mace/data/atomic_data.py`, `mace/data/utils.py`):
-   - Add `bec: Optional[torch.Tensor]  # [N_atoms, 3, 3]` field to `AtomicData`
-   - Add `bec_weight` per-config scalar weight (follow `forces_weight` pattern)
-   - Load BEC from xyz `arrays` key (e.g. `REF_bec`, shape `[N, 3, 3]` per atom)
-
-2. **Loss function** (`mace/modules/loss.py`):
-   - Add `mean_squared_error_bec(ref, pred, ddp)` — per-atom MSE on `[N, 3, 3]` tensor
-   - Add `DipolePolarBECLoss` (or extend `DipolePolarLoss`) with `bec_weight` term
-   - Register new loss name in `get_loss_fn()` in `scripts_utils.py`
-
-3. **Training loop** (`mace/tools/train.py`, `mace/tools/model_script_utils.py`):
-   - Add `"bec": args.compute_bec` to `output_args` in `configure_model()`
-   - In `take_step()` / the distributed training closure: when `output_args["bec"]`, pass `compute_dielectric_derivatives=True, create_graph_for_derivatives=True` to the model call
-   - Note: `compute_raman_tensors` should be False unless training on Raman too (avoid 9 extra VJPs)
-
-4. **CLI args** (`mace/tools/arg_parser.py` or `arg_parser_tools.py`):
-   - Add `--bec_weight` argument
-   - Add `--loss dipole_polar_bec` option
-
-5. **`run_train.py`**:
-   - In the `AtomicDielectricMACE` branch, set `args.compute_bec = True` when `args.loss` involves BEC
+`MACELoss` (train.py) additionally reports, when BEC is present:
+- `rmse_bec` (printed as `RMSE_BEC=… me`, i.e. ×1000 → milli-e; RMSE over all N×3×3 labeled elements, unlabeled configs excluded via `filter_nonzero_weight`).
+- `pct_loss_{dipole,polarizability,bec}` (printed as `loss%[mu/pol/bec]=…`), each = weighted term / total × 100 over the validation set. Tells you what's driving the optimizer — retune `--bec_weight` if BEC's share is too small/large. Both come from `component_losses`; absent for losses that don't expose it (back-compatible).
 
 ### The critical `create_graph` constraint
 
-During training, `loss.backward()` must differentiate through the BEC computation (which is itself a `torch.autograd.grad` call) to reach model parameters. This requires `create_graph=True` in the VJP, set via `create_graph_for_derivatives=True` on `forward()`. Without it, `bec` in the model output has no gradient path to model parameters and contributes nothing to training.
-
-This makes each training step expensive (second-order graph over N atoms × 3 components). Consider:
-- Only enabling BEC loss after initial dipole+polarizability pretraining converges (two-stage training)
-- Using a small `bec_weight` relative to dipole/polarizability losses
-- Gradient checkpointing if memory is an issue
+During training, `loss.backward()` must differentiate through the BEC computation (itself a `torch.autograd.grad` VJP) to reach model parameters — requires `create_graph=True` in the VJP (`create_graph_for_derivatives=True`). Without it `bec` has no gradient path to parameters and contributes nothing. This builds a second-order graph over N atoms × 3 components each step (dominant cost), which is why `bec_model_kwargs` gates it to labeled batches. To manage cost:
+- Delay BEC onset with `--start_bec_epoch K` (pretrain dipole+polar first), or restart-fine-tune from a dipole+polar checkpoint.
+- Keep `--bec_weight` sensible (watch the `loss%` field).
 
 ---
 
@@ -206,14 +176,51 @@ Placeholder for a future sparse BEC implementation using MACE locality (nonzero 
 ### `get_dielectric_derivatives()` (mace.py ~line 756)
 Inference-only convenience method. Returns `bec` and `raman_tensors` (already permuted/shaped), and stores them in `self.results`. Separate from `calculate()`.
 
+### Batched BEC reshape (models.py forward — important for training)
+`compute_dielectric_gradients` returns `[3*n_graphs, N, 3]` for a batched input, **not** `[3, N, 3]`. The correct build is reshape to `[n_graphs, C, N, 3]` and **sum over the graph axis** (cross-graph derivative blocks are structurally zero), then permute — reduces to the old single-graph `permute(1,0,2)` when `n_graphs==1`:
+```python
+bec = dmu_dr.view(num_graphs, 3, n_atoms, 3).sum(dim=0).permute(1, 0, 2).contiguous()          # [N,3,3]
+raman = dalpha_dr.view(num_graphs, 9, n_atoms, 3).sum(dim=0).permute(1,0,2).contiguous().reshape(n_atoms,3,3,3)
+```
+The old `dmu_dr.permute(1,0,2)` only worked because inference uses `batch_size=1`; with `batch_size>1` it gives `[N, 3*n_graphs, 3]` and BEC-loss shape errors. Do not revert.
+
 ---
+
+## Running BEC training
+
+```bash
+python mace/cli/run_train.py --model AtomicDielectricMACE \
+    --loss dipole_polar_bec \
+    --dipole_key REF_dipole --polarizability_key REF_polarizability --bec_key REF_bec \
+    --dipole_weight 1000 --polarizability_weight 2000 --bec_weight 100 \
+    --bec_loss_eps 1e-2 \        # >0 → relative BEC loss (the SFG lever); 0 → plain MSE
+    --start_bec_epoch 0 \        # >0 delays BEC onset (pretrain dipole+polar first)
+    --error_table DipolePolarRMSE --default_dtype float64 --device cuda ...
+```
+Example submission script: `~/NH3_NH4/NH3/dipole_and_pol_derivatives/ML/ML/models_6/submit_MDP_mace_dais.sh`.
+
+Note: `--num_channels` sets the hidden representation width; `--MLP_irreps` is only the readout MLP. The equivariant readout (`…x1o+…x2e`) carries the off-axis (⊥) dipole derivative — widening it is a capacity lever for the SFG problem.
+
+## Post-training evaluation & plotting (AUX/)
+
+```bash
+python AUX/eval_all_splits.py --train train.xyz --val val.xyz --test test.xyz \
+    --model mace_mu_alpha_bec.model --model_type DipolePolarizabilityMACE --device cuda \
+    --ref_dipole_key REF_dipole --ref_polarizability_key REF_polarizability \
+    --compute_bec --ref_bec_key REF_bec          # writes per-atom MACE_bec/REF_bec to *.out.xyz
+
+python AUX/plot_eval.py bec test.out.xyz train.out.xyz val.out.xyz            # lab-frame, 9 panels
+python AUX/plot_eval.py bec test.out.xyz --project-oh                          # ALSO bond-frame 2x2
+```
+`--project-oh` (bec only) rotates each central atom's BEC into its bond frame and adds a **2×2 ∥/⊥ decomposition** (`∂μ∥/∂R∥`, `∂μ∥/∂R⊥`, `∂μ⊥/∂R∥`, `∂μ⊥/∂R⊥`) **in addition to** the 9-panel lab-frame figure. The `∂R⊥` / `∂μ⊥` panels are the SFG-critical directions. Bond identified by `--bond-central`/`--bond-partner`/`--bond-cutoff` (defaults H/O/1.3 Å; use `--bond-partner N` for ammonia); minimum-image applied when periodic. Output: 9-panel → `plot_bec.*` (or `--output NAME`), 2×2 → `plot_bec_HO.*` (or `NAME_oh.*`).
 
 ## Running tests
 
 ```bash
+pytest tests/test_bec_training.py -v                  # BEC data/loss/end-to-end (env: mace-stream_local)
 pytest tests/test_calculator.py::test_calculator_bec_raman -v
 pytest tests/test_calculator.py::test_calculator_bec_raman_via_get_property -v
-pytest tests/test_polar_models.py -v
+pytest tests/test_polar_models.py -v                  # skipped locally (graph_longrange not installed)
 ```
 
 ---
