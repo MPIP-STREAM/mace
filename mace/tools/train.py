@@ -139,16 +139,26 @@ def valid_err_log(
             f"RMSE_MU_per_atom={error_mu:.2f} me A, "
             f"RMSE_polarizability_per_atom={error_polarizability:.2f} me A^2 / V"
         )
+        bec_in_loss = eval_metrics.get("bec_in_loss", True)
         if eval_metrics.get("rmse_bec") is not None:
             error_bec = eval_metrics["rmse_bec"] * 1e3
-            line += f", RMSE_BEC={error_bec:.2f} me"
+            # Parenthesised marker when BEC is monitored but NOT trained/in the loss.
+            suffix = "" if bec_in_loss else " (not in loss)"
+            line += f", RMSE_BEC={error_bec:.2f} me{suffix}"
         if eval_metrics.get("pct_loss_dipole") is not None:
-            line += (
-                f", loss%[mu/pol/bec]="
-                f"{eval_metrics['pct_loss_dipole']:.0f}/"
-                f"{eval_metrics['pct_loss_polarizability']:.0f}/"
-                f"{eval_metrics['pct_loss_bec']:.0f}"
-            )
+            if bec_in_loss and eval_metrics.get("pct_loss_bec") is not None:
+                line += (
+                    f", loss%[mu/pol/bec]="
+                    f"{eval_metrics['pct_loss_dipole']:.0f}/"
+                    f"{eval_metrics['pct_loss_polarizability']:.0f}/"
+                    f"{eval_metrics['pct_loss_bec']:.0f}"
+                )
+            else:
+                line += (
+                    f", loss%[mu/pol]="
+                    f"{eval_metrics['pct_loss_dipole']:.0f}/"
+                    f"{eval_metrics['pct_loss_polarizability']:.0f}"
+                )
         logging.info(line)
     elif log_errors == "EnergyDipoleRMSE":
         error_e = eval_metrics["rmse_e_per_atom"] * 1e3
@@ -212,6 +222,7 @@ def train(
             data_loader=valid_loader,
             output_args=output_args,
             device=device,
+            bec_in_loss=output_args.get("bec", False) and epoch >= start_bec_epoch,
         )
         valid_err_log(
             valid_loss_head, eval_metrics, logger, log_errors, None, valid_loader_name
@@ -281,6 +292,8 @@ def train(
                         data_loader=valid_loader,
                         output_args=output_args,
                         device=device,
+                        bec_in_loss=output_args.get("bec", False)
+                        and epoch >= start_bec_epoch,
                     )
                     if rank == 0:
                         valid_err_log(
@@ -607,9 +620,13 @@ def evaluate(
     data_loader: DataLoader,
     output_args: Dict[str, bool],
     device: torch.device,
+    bec_in_loss: bool = True,
 ) -> Tuple[float, Dict[str, Any]]:
 
-    metrics = MACELoss(loss_fn=loss_fn).to(device)
+    # bec_in_loss=False: BEC is still computed and RMSE_BEC still reported, but
+    # the BEC term is excluded from the validation loss (and thus the scheduler /
+    # early-stopping). Used during the pre-BEC pretraining phase (< start_bec_epoch).
+    metrics = MACELoss(loss_fn=loss_fn, bec_in_loss=bec_in_loss).to(device)
 
     start_time = time.time()
 
@@ -634,9 +651,12 @@ def evaluate(
 
 
 class MACELoss(Metric):
-    def __init__(self, loss_fn: torch.nn.Module):
+    def __init__(self, loss_fn: torch.nn.Module, bec_in_loss: bool = True):
         super().__init__()
         self.loss_fn = loss_fn
+        # When False, the BEC term is excluded from total_loss / loss% (but
+        # RMSE_BEC is still computed). Set during pre-BEC-epoch pretraining.
+        self.bec_in_loss = bec_in_loss
         self.add_state("total_loss", default=torch.tensor(0.0), dist_reduce_fx="sum")
         self.add_state("num_data", default=torch.tensor(0.0), dist_reduce_fx="sum")
         self.add_state("E_computed", default=torch.tensor(0.0), dist_reduce_fx="sum")
@@ -676,18 +696,19 @@ class MACELoss(Metric):
     def update(self, batch, output):  # pylint: disable=arguments-differ
         if hasattr(self.loss_fn, "component_losses"):
             comps = self.loss_fn.component_losses(pred=output, ref=batch)
-            loss = None
-            for term in comps.values():
-                loss = term if loss is None else loss + term
-            self.sum_loss_dipole += comps.get(
-                "dipole", torch.zeros((), device=self.total_loss.device)
-            ).detach()
-            self.sum_loss_polar += comps.get(
-                "polarizability", torch.zeros((), device=self.total_loss.device)
-            ).detach()
-            self.sum_loss_bec += comps.get(
-                "bec", torch.zeros((), device=self.total_loss.device)
-            ).detach()
+            zero = torch.zeros((), device=self.total_loss.device)
+            dip = comps.get("dipole", zero)
+            pol = comps.get("polarizability", zero)
+            bec = comps.get("bec", zero)
+            self.sum_loss_dipole += dip.detach()
+            self.sum_loss_polar += pol.detach()
+            self.sum_loss_bec += bec.detach()
+            # During pre-BEC pretraining (bec_in_loss=False) the BEC term is
+            # monitored (RMSE_BEC) but NOT added to the loss the optimizer /
+            # scheduler / early-stopping see.
+            loss = dip + pol
+            if self.bec_in_loss:
+                loss = loss + bec
         else:
             loss = self.loss_fn(pred=output, ref=batch)
         self.total_loss += loss
@@ -848,8 +869,13 @@ class MACELoss(Metric):
             delta_bec = self.convert(self.delta_bec)
             aux["mae_bec"] = compute_mae(delta_bec)
             aux["rmse_bec"] = compute_rmse(delta_bec)
-        # Per-component share (%) of the total loss (weighted terms).
-        total_terms = self.sum_loss_dipole + self.sum_loss_polar + self.sum_loss_bec
+        # Per-component share (%) of the total loss (weighted terms). Only the
+        # terms actually in the loss are counted, so when bec_in_loss is False
+        # the shares are over dipole+polar and no pct_loss_bec is reported.
+        aux["bec_in_loss"] = self.bec_in_loss
+        total_terms = self.sum_loss_dipole + self.sum_loss_polar
+        if self.bec_in_loss:
+            total_terms = total_terms + self.sum_loss_bec
         if to_numpy(total_terms).item() > 0.0:
             aux["pct_loss_dipole"] = to_numpy(
                 100.0 * self.sum_loss_dipole / total_terms
@@ -857,8 +883,9 @@ class MACELoss(Metric):
             aux["pct_loss_polarizability"] = to_numpy(
                 100.0 * self.sum_loss_polar / total_terms
             ).item()
-            aux["pct_loss_bec"] = to_numpy(
-                100.0 * self.sum_loss_bec / total_terms
-            ).item()
+            if self.bec_in_loss:
+                aux["pct_loss_bec"] = to_numpy(
+                    100.0 * self.sum_loss_bec / total_terms
+                ).item()
 
         return aux["loss"], aux
