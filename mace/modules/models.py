@@ -1132,6 +1132,11 @@ class AtomicDielectricMACE(torch.nn.Module):
             total_polarizability = spherical_to_cartesian(
                 total_polarizability_spherical, self.change_of_basis
             )
+            # Per-atom polarizabilities in cartesian form; sum over atoms of a
+            # graph equals total_polarizability by construction.
+            atomic_polarizabilities_cartesian = spherical_to_cartesian(
+                atomic_polarizabilities, self.change_of_basis
+            )  # [n_nodes, 3, 3]
 
             if compute_dielectric_derivatives:
                 dmu_dr = compute_dielectric_gradients(
@@ -1197,6 +1202,7 @@ class AtomicDielectricMACE(torch.nn.Module):
                 bec = None
             total_polarizability = None
             total_polarizability_spherical = None
+            atomic_polarizabilities_cartesian = None
             dalpha_dr = None
             raman_tensors = None
 
@@ -1204,6 +1210,7 @@ class AtomicDielectricMACE(torch.nn.Module):
             "charges": atomic_charges,
             "dipole": total_dipole,
             "atomic_dipoles": atomic_dipoles,
+            "atomic_polarizabilities": atomic_polarizabilities_cartesian,
             "polarizability": total_polarizability,
             "polarizability_sh": total_polarizability_spherical,
             "dmu_dr": dmu_dr,
